@@ -126,8 +126,8 @@ export function jsonparse(jsonText, filename /*optional*/) {
 }
 
 export function jsonparseFile(filename) {
-  const json = fs.readFileSync(filename, "utf8")
   try {
+    const json = fs.readFileSync(filename, "utf8")
     return jsonparse(json)
   } catch (err) {
     throw new Error(`failed to parse ${filename}: ${err.message || err}`)

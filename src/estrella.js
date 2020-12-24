@@ -409,6 +409,7 @@ async function build1(config, ctx) {
     config.outdir = opts.outdir || undefined
     config.bundle = opts.bundle || undefined
     config.minify = opts.minify || undefined
+    config.plugins = opts.plugins || undefined
 
     if (opts.esbuild) {
       const esbuildProps = jsonparse(opts.esbuild, "-esbuild")
