@@ -35,7 +35,7 @@ import { chmod } from "./chmod"
 import * as typeinfo from "./typeinfo"
 import { createBuildConfig } from "./config"
 import { sha1 } from "./hash"
-import * as aux from "./aux"
+import * as extra from "./extra"
 
 const { dirname, basename } = Path
 
@@ -53,6 +53,7 @@ const CLI_DOC = {
     ["-color"            ,"Color terminal output, regardless of TTY status."],
     ["-diag"             ,"Only run TypeScript diagnostics (no esbuild.)"],
     ["-quiet"            ,"Only log warnings and errors but nothing else."],
+    ["-silent"           ,"Don't log anything, not even errors."],
     ["-estrella-version" ,"Print version of estrella and exit 0."],
     ["-estrella-debug"   ,"Enable debug logging of estrella itself."],
   ],
@@ -128,7 +129,7 @@ function setErrorExitCode(code) {
 }
 
 
-function processConfig(config) {
+function processAPIConfig(config) {
   // support use of both entry and entryPoints
   log.debug(()=>`input config ${repr(config)}`)
   if (!config.entryPoints) {
@@ -162,6 +163,18 @@ function processConfig(config) {
     config.sourcemap = false
   }
 
+  // if outfile is empty or missing, use a temporary file (esbuild needs a file to write to.)
+  // Note: outfile="-" is handled by build1, prior to calling processAPIConfig.
+  if (!config.outfile && !config.outdir) {
+    config.setOutfile("-") // set since it's used by updateProjectID
+    const projectID = config.updateProjectID()
+    config.setOutfile(Path.join(tmpdir(), `esbuild.${projectID}.out.js`))
+    config.outfileIsTemporary = true
+    // Note: We let config.outfileCopyToStdout be false (default) since the expected behavior
+    // in the case of outfile="" is for nothing to appear on stdout but only contents returned
+    // through the API, to onEnd.
+  }
+
   config.updateProjectID()
   log.debug(()=>`effective config for project#${config.projectID}: ${repr(config)}`)
 }
@@ -171,10 +184,13 @@ function patchSourceMap(mapfile, overrides) {
   const timeStarted = clock()
   const map = JSON.parse(fs.readFileSync(mapfile))
   for (let k in overrides) {
-    const v = overrides[k]
+    let v = overrides[k]
     if (v === undefined) {
       delete map[k]
     } else {
+      if (typeof v == "function") {
+        v = v(map[k])
+      }
       map[k] = v
     }
   }
@@ -239,6 +255,10 @@ function esbuildOptionsFromConfig(config) {
       `Notice: Potentially invalid esbuild.BuildOption(s): ${repr(unknownOptions)}\n` +
       bugReportMessage("guess", json(Object.keys(unknownOptions)))
     )
+  }
+
+  if (!esbuildOptions.outfile) {
+    delete esbuildOptions.outfile
   }
 
   return esbuildOptions
@@ -338,9 +358,23 @@ async function build1(config, ctx) {
     config.run = opts.run
   }
 
+  // if outfile is "-", use a temporary file (esbuild needs a file to write to)
+  if (
+    config.outfile == "-" ||
+    opts.outfile == "-" ||
+    (isMainCall && !opts.outfile && !opts.outdir)
+  ) {
+    config.setOutfile("-") // set since it's used by updateProjectID
+    const projectID = config.updateProjectID()
+    opts.outfile = Path.join(tmpdir(), `esbuild.${projectID}.out.js`)
+    config.setOutfile(opts.outfile)
+    config.outfileIsTemporary = true
+    config.outfileCopyToStdout = true
+  }
+
   if (!isMainCall) {
     // process config when build is called as a function
-    processConfig(config)
+    processAPIConfig(config)
   } else {
     // BEGIN special logic for when running this script directly as a program
 
@@ -370,13 +404,6 @@ async function build1(config, ctx) {
       }
     }
 
-    if (opts.outfile == "-" || (!opts.outfile && !opts.outdir)) {
-      config.setOutfile("-") // set since it's used by updateProjectID
-      const projectID = config.updateProjectID()
-      opts.outfile = Path.join(tmpdir(), `esbuild.${projectID}.out.js`)
-      config.outfileIsTemporary = true
-    }
-
     config.setOutfile(opts.outfile || undefined)
     config.entryPoints = args
     config.outdir = opts.outdir || undefined
@@ -401,7 +428,8 @@ async function build1(config, ctx) {
 
   // smash config options and CLI options together
   const debug = config.debug = opts.debug = !!(opts.debug || config.debug)
-  const quiet = config.quiet = opts.quiet = !!(opts.quiet || config.quiet)
+  const silent = config.silent = opts.silent = !!(opts.silent || config.silent)
+  const quiet = config.quiet = opts.quiet = silent || !!(opts.quiet || config.quiet)
   opts.watch = !!(opts.watch || config.watch)
   if (!config.watch || typeof config.watch != "object") {
     config.watch = opts.watch
@@ -415,7 +443,7 @@ async function build1(config, ctx) {
   }
 
   if (quiet) {
-    log.level = log.WARN
+    log.level = silent ? log.SILENT : log.WARN
   }
 
   config.sourcemap = (
@@ -423,6 +451,10 @@ async function build1(config, ctx) {
     opts.sourcemap ? true :
     config.sourcemap
   )
+  if (config.outfileIsTemporary && config.outfileCopyToStdout && config.sourcemap === true) {
+    // when writing to stdout, "sourcemap:true" means "inline" rather than "yes, write a map file".
+    config.sourcemap = "inline"
+  }
 
   config.clear = (
     opts["no-clear"] ? false :
@@ -531,9 +563,13 @@ async function build1(config, ctx) {
     }
   }
 
+  // Note: wrapOnEnd stacks functions, meaning that a function defined earlier in this source
+  // file will be called later in time.
+
   // chmod handler
   if (config.outfileMode && config.outfile) {
     wrapOnEnd(async (buildResults, ok) => {
+      log.debug("onEnd chmod")
       if (buildResults.errors.length == 0) {
         try {
           chmod(config.outfileAbs, config.outfileMode)
@@ -546,8 +582,9 @@ async function build1(config, ctx) {
   }
 
   // tmp outfile handler
-  if (config.outfileIsTemporary && !config.run) {
+  if (config.outfileCopyToStdout && !config.run && config.write !== false) {
     wrapOnEnd(async (buildResults, ok) => {
+      log.debug("onEnd copyToStdout")
       if (buildResults.errors.length == 0) {
         return new Promise((resolve, reject) => {
           const r = fs.createReadStream(config.outfileAbs)
@@ -555,6 +592,27 @@ async function build1(config, ctx) {
           r.on("error", reject)
           r.pipe(process.stdout)
         })
+      }
+    })
+  }
+
+  // add contents of output to onEnd when writing to a temporary file (not stdout)
+  if (config.outfileIsTemporary && !config.outfileCopyToStdout && config.write !== false) {
+    wrapOnEnd(async (buildResults, ok) => {
+      log.debug("onEnd load results")
+      buildResults.js = fs.readFileSync(config.outfile, {encoding:"utf8"})
+      if (config.sourcemap === true) {
+        try {
+          buildResults.map = fs.readFileSync(config.outfile + ".map", {encoding:"utf8"})
+        } catch (err) {
+          log.debug(
+            `failed to load temporary source map at ${config.outfile}.map: ${err.stack||err}`)
+        }
+        // strip "sourceMappingURL ..." from js
+        const i = buildResults.js.lastIndexOf("\n//# sourceMappingURL")
+        if (i != -1) {
+          buildResults.js = buildResults.js.substr(0, i+1) // +1 = keep LF
+        }
       }
     })
   }
@@ -581,6 +639,7 @@ async function build1(config, ctx) {
     minify: !debug,
     sourcemap: config.sourcemap,
     color: stderrStyle.ncolors > 0,
+    logLevel: config.silent ? "silent" : config.quiet ? "warning" : "info",
 
     ...esbuildOptionsFromConfig(config),
 
@@ -631,14 +690,19 @@ async function build1(config, ctx) {
       ))
     } else {
       let outname = config.outfile
-      if (config.sourcemap && config.sourcemap != "inline") {
+      if (config.sourcemap && config.sourcemap != "inline" && config.write !== false) {
         const ext = Path.extname(config.outfile)
         const name = Path.join(Path.dirname(config.outfile), Path.basename(config.outfile, ext))
         outname = `${name}.{${ext.substr(1)},${ext.substr(1)}.map}`
-        patchSourceMap(config.outfileAbs + ".map", {
+        const changes = {
           sourcesContent: undefined,
           sourceRoot: Path.relative(Path.dirname(config.outfile), config.cwd),
-        })
+        }
+        if (config.outfileIsTemporary) {
+          changes.sourceRoot = "."
+          changes.sources = v => v && v.map(fn => Path.relative(process.cwd(), fn))
+        }
+        patchSourceMap(config.outfileAbs + ".map", changes)
       }
       let size = 0
       try { size = fs.statSync(config.outfileAbs).size } catch(_) {}
@@ -655,7 +719,8 @@ async function build1(config, ctx) {
     let errors = err.errors || []
     let showStackTrace = options && options.showStackTrace
     if (errors.length == 0) {
-      // this seems to be a bug in esbuild; errors are not set even when there are errors.
+      // in this case the err is an Error object and describes the error
+      log.error(err.message)
       errors.push({
         text: String(showStackTrace && err.stack ? err.stack : err),
         location: null,
@@ -747,7 +812,7 @@ async function build1(config, ctx) {
   if (config.watch) {
     // keep a copy of the last metadata around in case of read failure (return old data)
     let esbuildMeta = {}
-    function getESBuildMeta() {
+    function getESBuildMeta() { // :Object|null
       try {
         esbuildMeta = jsonparseFile(esbuildOptions.metafile)
         // note: intentionally leave the file in case of an exception in jsonparseFile
@@ -763,7 +828,7 @@ async function build1(config, ctx) {
       }
       return esbuildMeta
     }
-    await aux.watch().watchFiles(config, getESBuildMeta, ctx, changedFiles => {
+    await extra.watch().watchFiles(config, getESBuildMeta, ctx, changedFiles => {
       // This function is invoked whenever source files changed.
       // Note that the watchFiles() function takes care of updating source file tracking.
       const filenames = changedFiles.map(f => Path.relative(config.cwd, f))
@@ -1019,7 +1084,7 @@ if (
 
 
 function watch(path, options, cb) {
-  return aux.watch().watch(path, options, cb)
+  return extra.watch().watch(path, options, cb)
 }
 
 
